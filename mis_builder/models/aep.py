@@ -14,6 +14,8 @@ from .accounting_none import AccountingNone
 
 _DOMAIN_START_RE = re.compile(r"\(|(['\"])[!&|]\1")
 
+UNCLASSIFIED_ROW_DETAIL = "other"
+
 
 def _is_domain(s):
     """Test if a string looks like an Odoo domain"""
@@ -300,6 +302,7 @@ class AccountingExpressionProcessor(object):
         date_to,
         additional_move_line_filter=None,
         aml_model=None,
+        auto_expand_col_name=None,
     ):
         """Query sums of debit and credit for all accounts and domains
         used in expressions.
@@ -330,13 +333,15 @@ class AccountingExpressionProcessor(object):
             domain.append(("account_id", "in", self._map_account_ids[key]))
             if additional_move_line_filter:
                 domain.extend(additional_move_line_filter)
+
+            get_fields = ["debit", "credit", "account_id", "company_id"]
+            group_by_fields = ["account_id", "company_id"]
+            if auto_expand_col_name:
+                get_fields = [auto_expand_col_name] + get_fields
+                group_by_fields = [auto_expand_col_name] + group_by_fields
+
             # fetch sum of debit/credit, grouped by account_id
-            accs = aml_model.read_group(
-                domain,
-                ["debit", "credit", "account_id", "company_id"],
-                ["account_id", "company_id"],
-                lazy=False,
-            )
+            accs = aml_model.read_group(domain, get_fields, group_by_fields, lazy=False)
             for acc in accs:
                 rate, dp = company_rates[acc["company_id"][0]]
                 debit = acc["debit"] or 0.0
@@ -346,19 +351,47 @@ class AccountingExpressionProcessor(object):
                 ):
                     # in initial mode, ignore accounts with 0 balance
                     continue
-                self._data[key][acc["account_id"][0]] = (debit * rate, credit * rate)
+                rdi_id = self.get_rdi_id(auto_expand_col_name, acc)
+                if not self._data[key].get(rdi_id, False):
+                    self._data[key][rdi_id] = defaultdict(dict)
+                self._data[key][rdi_id][acc["account_id"][0]] = (
+                    debit * rate,
+                    credit * rate,
+                )
         # compute ending balances by summing initial and variation
         for key in ends:
             domain, mode = key
             initial_data = self._data[(domain, self.MODE_INITIAL)]
             variation_data = self._data[(domain, self.MODE_VARIATION)]
-            account_ids = set(initial_data.keys()) | set(variation_data.keys())
-            for account_id in account_ids:
-                di, ci = initial_data.get(account_id, (AccountingNone, AccountingNone))
-                dv, cv = variation_data.get(
-                    account_id, (AccountingNone, AccountingNone)
+            rdis = set(initial_data.keys()) | set(variation_data.keys())
+            for rdi in rdis:
+                if not initial_data.get(rdi, False):
+                    initial_data[rdi] = defaultdict(dict)
+                if not variation_data.get(rdi, False):
+                    variation_data[rdi] = defaultdict(dict)
+                if not self._data[key].get(rdi, False):
+                    self._data[key][rdi] = defaultdict(dict)
+
+                account_ids = set(initial_data[rdi].keys()) | set(
+                    variation_data[rdi].keys()
                 )
-                self._data[key][account_id] = (di + dv, ci + cv)
+                for account_id in account_ids:
+                    di, ci = initial_data[rdi].get(
+                        account_id, (AccountingNone, AccountingNone)
+                    )
+                    dv, cv = variation_data[rdi].get(
+                        account_id, (AccountingNone, AccountingNone)
+                    )
+                    self._data[key][rdi][account_id] = (di + dv, ci + cv)
+
+    def get_rdi_id(self, auto_expand_col_name, acc):
+        if (
+            auto_expand_col_name
+            and auto_expand_col_name in acc
+            and acc[auto_expand_col_name]
+        ):
+            return acc[auto_expand_col_name][0]
+        return UNCLASSIFIED_ROW_DETAIL
 
     def replace_expr(self, expr):
         """Replace accounting variables in an expression by their amount.
@@ -371,23 +404,25 @@ class AccountingExpressionProcessor(object):
         def f(mo):
             field, mode, acc_domain, ml_domain = self._parse_match_object(mo)
             key = (ml_domain, mode)
-            account_ids_data = self._data[key]
+            rdi_ids_data = self._data[key]
             v = AccountingNone
             account_ids = self._account_ids_by_acc_domain[acc_domain]
-            for account_id in account_ids:
-                debit, credit = account_ids_data.get(
-                    account_id, (AccountingNone, AccountingNone)
-                )
-                if field == "bal":
-                    v += debit - credit
-                elif field == "pbal" and debit >= credit:
-                    v += debit - credit
-                elif field == "nbal" and debit < credit:
-                    v += debit - credit
-                elif field == "deb":
-                    v += debit
-                elif field == "crd":
-                    v += credit
+            for rdi in rdi_ids_data:
+                account_ids_data = self._data[key][rdi]
+                for account_id in account_ids:
+                    debit, credit = account_ids_data.get(
+                        account_id, (AccountingNone, AccountingNone)
+                    )
+                    if field == "bal":
+                        v += debit - credit
+                    elif field == "pbal" and debit >= credit:
+                        v += debit - credit
+                    elif field == "nbal" and debit < credit:
+                        v += debit - credit
+                    elif field == "deb":
+                        v += debit
+                    elif field == "crd":
+                        v += credit
             # in initial balance mode, assume 0 is None
             # as it does not make sense to distinguish 0 from "no data"
             if (
@@ -470,7 +505,59 @@ class AccountingExpressionProcessor(object):
         aep.parse_expr(expr)
         aep.done_parsing()
         aep.do_queries(date_from, date_to)
-        return aep._data[((), mode)]
+        return aep._data[((), mode)].get(UNCLASSIFIED_ROW_DETAIL, {})
+
+    def replace_exprs_by_row_detail(self, exprs):
+        """Replace accounting variables in a list of expression
+        by their amount, iterating by accounts involved in the expression.
+
+        yields account_id, replaced_expr
+
+        This method must be executed after do_queries().
+        """
+
+        def f(mo):
+            field, mode, acc_domain, ml_domain = self._parse_match_object(mo)
+            key = (ml_domain, mode)
+            v = AccountingNone
+            account_ids_data = self._data[key][rdi_id]
+            account_ids = self._account_ids_by_acc_domain[acc_domain]
+
+            for account_id in account_ids:
+                debit, credit = account_ids_data.get(
+                    account_id, (AccountingNone, AccountingNone)
+                )
+                if field == "bal":
+                    v += debit - credit
+                elif field == "pbal" and debit >= credit:
+                    v += debit - credit
+                elif field == "nbal" and debit < credit:
+                    v += debit - credit
+                elif field == "deb":
+                    v += debit
+                elif field == "crd":
+                    v += credit
+            # in initial balance mode, assume 0 is None
+            # as it does not make sense to distinguish 0 from "no data"
+            if (
+                v is not AccountingNone
+                and mode in (self.MODE_INITIAL, self.MODE_UNALLOCATED)
+                and float_is_zero(v, precision_digits=self.dp)
+            ):
+                v = AccountingNone
+            return "(" + repr(v) + ")"
+
+        rdi_ids = set()
+        for expr in exprs:
+            for mo in self._ACC_RE.finditer(expr):
+                field, mode, acc_domain, ml_domain = self._parse_match_object(mo)
+                key = (ml_domain, mode)
+                rdis_data = self._data[key]
+                for rdi_id in rdis_data.keys():
+                    rdi_ids.add(rdi_id)
+
+        for rdi_id in rdi_ids:
+            yield rdi_id, [self._ACC_RE.sub(f, expr) for expr in exprs]
 
     @classmethod
     def get_balances_initial(cls, companies, date):
